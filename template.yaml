@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  MyAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Description: Example HTTP API
+      Name: api-with-auth
+      ProtocolType: HTTP
+  JWTAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref MyAPI
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authentication'
+      JwtConfiguration:
+        Audience:
+          - !Ref AppClient
+        Issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+      Name: test-jwt-authorizer
+  IntegrationSampleAPI:
+    Type: 'AWS::ApiGatewayV2::Integration'
+    Properties:
+      ApiId: !Ref MyAPI
+      Description: Lambda Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Join
+        - ''
+        - - 'arn:'
+          - !Ref 'AWS::Partition'
+          - ':apigateway:'
+          - !Ref 'AWS::Region'
+          - ':lambda:path/2015-03-31/functions/'
+          - !GetAtt MyLambdaFunction.Arn
+          - /invocations
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
+  RouteSampleAPI:
+    Type: "AWS::ApiGatewayV2::Route"
+    Properties:
+      RouteKey: "GET /sampleApi"
+      ApiId: !Ref MyAPI
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JWTAuthorizer
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref IntegrationSampleAPI
+  StageSampleAPI:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref MyAPI
+      AutoDeploy: true
+      StageName: '$default'
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Architectures:
+        - arm64
+      Runtime: nodejs18.x
+      Role: !GetAtt FunctionExecutionRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: !Sub |
+          const {CognitoIdentityProviderClient, InitiateAuthCommand, GetUserCommand} = require("@aws-sdk/client-cognito-identity-provider");
+          
+          const authClient = new CognitoIdentityProviderClient({});
+          const mapUserInfo = (rawUser)=>{
+          const info = {username: rawUser.Username};
+          rawUser.UserAttributes.forEach((attr)=>{
+            info[attr.Name] = attr.Value;
+          })
+          return info;
+          }
+          const getUser = async (clientId, accessToken) => {
+            const input = { 
+            AccessToken: accessToken,
+            }
+            const command = new GetUserCommand(input);
+            const response = await authClient.send(command);
+            const info = mapUserInfo(response);
+            return info;
+            } 
+          exports.handler = async (event) => {    
+            const clientId = event.requestContext.authorizer.jwt.claims.client_id;
+            const accessToken = event.headers.authentication;
+            const userInfo = await getUser(clientId, accessToken);
+              const response = {
+                  statusCode: 200,
+                  body: JSON.stringify(userInfo, null, 2)
+              };
+              return response;
+          };
+  APIInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MyLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MyAPI}/*/*/*
+  FunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: http-api-user-pool
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: account-id
+          AttributeDataType: String
+          Mutable: true
+  AppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      AllowedOAuthFlows:
+        - implicit
+      AllowedOAuthScopes:
+        - aws.cognito.signin.user.admin
+        - email
+        - openid
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      ClientName: api-app-client
+      CallbackURLs:
+        - !Sub https://${MyAPI}.execute-api.${AWS::Region}.amazonaws.com/welcome
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      UserPoolId: !Ref UserPool
+      SupportedIdentityProviders:
+        - COGNITO
+  HostedUI:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Join
+        - '-'
+        - - !Ref MyAPI
+          - !Ref AppClient
+      UserPoolId: !Ref UserPool
+Outputs:
+  SignupURL:
+    Value: !Sub https://${HostedUI}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${AppClient}&response_type=token&redirect_uri=https://${MyAPI}.execute-api.${AWS::Region}.amazonaws.com/welcome
+  AppClientId:
+    Value: !Sub ${AppClient}
+  GetTokenURL:
+    Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/token
+  SampleApiURL:
+    Value: !Sub https://${MyAPI}.execute-api.us-east-1.amazonaws.com/sampleApi
